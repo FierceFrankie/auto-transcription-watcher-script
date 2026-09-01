@@ -1,0 +1,8 @@
+faster-whisper
+nemo_toolkit[asr]
+hydra-core
+lightning
+pyannote.audio
+watchdog
+soundfile
+torch
