@@ -1,6 +1,8 @@
 import json
 import os
 import time
+import inspect
+import gc
 from pathlib import Path
 from queue import Queue
 from threading import Thread, Lock
@@ -458,10 +460,42 @@ def transcribe_with_parakeet(audio_file):
     Convert Parakeet word timestamps into segment-like chunks
     so the existing downstream speaker grouping logic can remain unchanged.
     """
-    result = parakeet.transcribe(
-        [str(audio_file)],
-        timestamps=True
-    )[0]
+    transcribe_kwargs = {
+        "timestamps": True
+    }
+    transcribe_signature = inspect.signature(parakeet.transcribe)
+
+    if "num_workers" in transcribe_signature.parameters:
+        transcribe_kwargs["num_workers"] = 0
+
+    if "batch_size" in transcribe_signature.parameters:
+        transcribe_kwargs["batch_size"] = 1
+
+    result = None
+    max_manifest_retries = 3
+
+    for attempt in range(1, max_manifest_retries + 1):
+        try:
+            result = parakeet.transcribe(
+                [str(audio_file)],
+                **transcribe_kwargs
+            )[0]
+            break
+        except PermissionError as e:
+            is_manifest_lock = (
+                getattr(e, "winerror", None) == 32
+                and "manifest.json" in str(e)
+            )
+
+            if not is_manifest_lock or attempt == max_manifest_retries:
+                raise
+
+            print(
+                f"Parakeet temporary manifest lock detected; "
+                f"retrying ({attempt}/{max_manifest_retries})..."
+            )
+            gc.collect()
+            time.sleep(attempt)
 
     words = []
     transcript_text = ""

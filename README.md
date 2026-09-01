@@ -8,6 +8,7 @@ Automatically monitor Voicemeeter recordings, transcribe audio using Faster-Whis
 - Automatically waits for recording completion
 - GPU-accelerated transcription using Faster-Whisper
 - Optional NVIDIA Parakeet ASR backend
+- Windows-safe Parakeet transcription retries for temporary manifest file locks
 - Speaker diarization with PyAnnote
 - Consecutive speaker segments grouped together
 - **Stable speaker IDs preserved** (`speaker_id`)
