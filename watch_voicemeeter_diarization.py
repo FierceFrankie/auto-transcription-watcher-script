@@ -12,6 +12,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from faster_whisper import WhisperModel
+import nemo.collections.asr as nemo_asr
 from pyannote.audio import Pipeline
 
 # --------------------------------------------------
@@ -30,6 +31,13 @@ RECORDING_IDLE_SECONDS = 30
 
 MAX_RETRIES = 3
 RETRY_DELAY = 30
+
+# ASR backend: "whisper" or "parakeet"
+ASR_BACKEND = os.getenv("ASR_BACKEND", "whisper").strip().lower()
+if ASR_BACKEND not in {"whisper", "parakeet"}:
+    raise RuntimeError(
+        "ASR_BACKEND must be 'whisper' or 'parakeet'"
+    )
 
 # --------------------------------------------------
 # HF TOKEN CHECK
@@ -65,13 +73,22 @@ torch.set_float32_matmul_precision("high")
 # LOAD MODELS
 # --------------------------------------------------
 
-print("Loading Whisper Large-v3-Turbo...")
+whisper = None
+parakeet = None
 
-whisper = WhisperModel(
-    "large-v3-turbo",
-    device="cuda",
-    compute_type="float16"
-)
+if ASR_BACKEND == "whisper":
+    print("Loading Whisper Large-v3-Turbo...")
+    whisper = WhisperModel(
+        "large-v3-turbo",
+        device="cuda",
+        compute_type="float16"
+    )
+elif ASR_BACKEND == "parakeet":
+    print("Loading Parakeet TDT 0.6B V2 (En)...")
+    parakeet = nemo_asr.models.ASRModel.from_pretrained(
+        model_name="nvidia/parakeet-tdt-0.6b-v2"
+    )
+    parakeet = parakeet.to("cuda")
 
 print("Loading PyAnnote...")
 
@@ -83,6 +100,100 @@ pipeline = Pipeline.from_pretrained(
 pipeline.to(torch.device("cuda"))
 
 print("Models loaded.")
+
+
+class Segment:
+    def __init__(self, start, end, text):
+        self.start = float(start)
+        self.end = float(end)
+        self.text = text
+
+
+class TranscriptionInfo:
+    def __init__(self, language="en"):
+        self.language = language
+
+
+def transcribe_with_whisper(audio_file):
+    segments, info = whisper.transcribe(
+        str(audio_file),
+        beam_size=5,
+        vad_filter=True,
+        word_timestamps=True,
+        condition_on_previous_text=False
+    )
+    return list(segments), info
+
+
+def transcribe_with_parakeet(audio_file):
+    """
+    Convert Parakeet word timestamps into segment-like chunks
+    so the existing downstream speaker grouping logic can remain unchanged.
+    """
+    result = parakeet.transcribe(
+        [str(audio_file)],
+        timestamps=True
+    )[0]
+
+    words = []
+    transcript_text = ""
+
+    if isinstance(result, dict):
+        words = result.get("words", []) or []
+        transcript_text = result.get("text", "") or ""
+    else:
+        transcript_text = str(result)
+
+    segments = []
+
+    if words:
+        current_words = []
+        seg_start = None
+        seg_end = None
+        max_gap_seconds = 0.8
+
+        for w in words:
+            w_start = float(w.get("start", 0.0))
+            w_end = float(w.get("end", w_start))
+            w_text = (w.get("word", "") or "").strip()
+
+            if not w_text:
+                continue
+
+            if seg_start is None:
+                seg_start = w_start
+                seg_end = w_end
+                current_words = [w_text]
+                continue
+
+            if (w_start - seg_end) <= max_gap_seconds:
+                current_words.append(w_text)
+                seg_end = w_end
+            else:
+                segments.append(
+                    Segment(
+                        seg_start,
+                        seg_end,
+                        " ".join(current_words)
+                    )
+                )
+                seg_start = w_start
+                seg_end = w_end
+                current_words = [w_text]
+
+        if current_words:
+            segments.append(
+                Segment(
+                    seg_start if seg_start is not None else 0.0,
+                    seg_end if seg_end is not None else 0.0,
+                    " ".join(current_words)
+                )
+            )
+    elif transcript_text.strip():
+        segments = [Segment(0.0, 0.0, transcript_text.strip())]
+
+    info = TranscriptionInfo(language="en")
+    return segments, info
 
 # --------------------------------------------------
 # DATABASE FUNCTIONS
@@ -309,22 +420,21 @@ def transcribe_file(audio_file):
             return best_speaker
 
         # ------------------------------------------
-        # WHISPER
+        # ASR
         # ------------------------------------------
 
         print(
             "Running transcription..."
         )
 
-        segments, info = whisper.transcribe(
-            str(audio_file),
-            beam_size=5,
-            vad_filter=True,
-            word_timestamps=True,
-            condition_on_previous_text=False
-        )
-
-        segments = list(segments)
+        if ASR_BACKEND == "whisper":
+            segments, info = transcribe_with_whisper(
+                audio_file
+            )
+        else:
+            segments, info = transcribe_with_parakeet(
+                audio_file
+            )
 
         # ------------------------------------------
         # OUTPUT
