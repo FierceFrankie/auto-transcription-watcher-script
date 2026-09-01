@@ -1,4 +1,5 @@
 faster-whisper
+whisperx
 nemo_toolkit[asr]
 hydra-core
 lightning
