@@ -27,6 +27,27 @@ DATABASE_FILE = Path(
     r"C:\AI\voicemeeter_processed.json"
 )
 
+SPEAKER_MAP_FILE = Path(
+    os.getenv(
+        "SPEAKER_MAP_FILE",
+        "config/speakers.json"
+    )
+)
+
+SPEAKER_HISTORY_FILE = Path(
+    os.getenv(
+        "SPEAKER_HISTORY_FILE",
+        "config/speaker_history.json"
+    )
+)
+
+ATTENDEE_LIST_FILE = Path(
+    os.getenv(
+        "ATTENDEE_LIST_FILE",
+        "config/attendees.txt"
+    )
+)
+
 RECORDING_IDLE_SECONDS = 30
 
 MAX_RETRIES = 3
@@ -68,6 +89,313 @@ queue_lock = Lock()
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
+
+# --------------------------------------------------
+# SPEAKER MAPPING / SUGGESTION HELPERS
+# --------------------------------------------------
+
+def load_json_file(path, default):
+    if not path.exists():
+        return default
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"WARNING: could not read {path}: {e}")
+        return default
+
+
+def save_json_file(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def normalize_name(value):
+    return " ".join(value.strip().split())
+
+
+def load_speaker_map():
+    mapping = load_json_file(SPEAKER_MAP_FILE, {})
+    if not isinstance(mapping, dict):
+        print(
+            f"WARNING: {SPEAKER_MAP_FILE} must be a JSON object; using empty mapping"
+        )
+        return {}
+
+    cleaned = {}
+    for speaker_id, name in mapping.items():
+        if not isinstance(speaker_id, str) or not isinstance(name, str):
+            continue
+        cleaned[speaker_id] = normalize_name(name)
+
+    return cleaned
+
+
+def load_speaker_history():
+    history = load_json_file(SPEAKER_HISTORY_FILE, {})
+    if not isinstance(history, dict):
+        print(
+            f"WARNING: {SPEAKER_HISTORY_FILE} must be a JSON object; using empty history"
+        )
+        return {}
+
+    cleaned = {}
+    for key, value in history.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            continue
+
+        canonical_name = value.get("canonical_name")
+        if not isinstance(canonical_name, str):
+            continue
+
+        confidence = value.get("confidence", 0.0)
+        try:
+            confidence = float(confidence)
+        except Exception:
+            confidence = 0.0
+
+        cleaned[key] = {
+            "canonical_name": normalize_name(canonical_name),
+            "confidence": max(0.0, min(1.0, confidence))
+        }
+
+    return cleaned
+
+
+def load_attendees():
+    if not ATTENDEE_LIST_FILE.exists():
+        return []
+
+    names = []
+    try:
+        with open(ATTENDEE_LIST_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                name = normalize_name(line)
+                if name:
+                    names.append(name)
+    except Exception as e:
+        print(f"WARNING: could not read {ATTENDEE_LIST_FILE}: {e}")
+
+    return names
+
+
+def suggest_speaker_names(
+    stable_speaker_ids,
+    speaker_map,
+    speaker_history,
+    attendees
+):
+    suggestions = {}
+
+    # First pass: previously confirmed/stored mapping history
+    for stable_id in stable_speaker_ids:
+        history_entry = speaker_history.get(stable_id)
+        if not history_entry:
+            continue
+
+        suggested_name = history_entry.get("canonical_name")
+        confidence = history_entry.get("confidence", 0.0)
+
+        if suggested_name and confidence >= 0.8:
+            suggestions[stable_id] = {
+                "suggested_name": suggested_name,
+                "source": "history",
+                "confidence": confidence
+            }
+
+    # Second pass: fallback to attendee list in stable-id order
+    available_attendees = [
+        a for a in attendees
+        if a not in set(speaker_map.values())
+    ]
+
+    attendee_index = 0
+    for stable_id in stable_speaker_ids:
+        if stable_id in speaker_map or stable_id in suggestions:
+            continue
+
+        if attendee_index < len(available_attendees):
+            suggestions[stable_id] = {
+                "suggested_name": available_attendees[attendee_index],
+                "source": "attendees",
+                "confidence": 0.5
+            }
+            attendee_index += 1
+
+    return suggestions
+
+
+def save_draft_speaker_artifacts(
+    audio_file,
+    diarized_segments,
+    speaker_map,
+    suggestions
+):
+    draft = {
+        "source_audio": str(audio_file),
+        "generated_at": datetime.now().isoformat(),
+        "segments": diarized_segments,
+        "speaker_map": speaker_map,
+        "suggestions": suggestions,
+        "how_to_update": (
+            "Edit config/speakers.json to set display names, "
+            "then run with RE_RENDER_ONLY=1 RE_RENDER_SOURCE=<path to this draft json>."
+        )
+    }
+
+    draft_file = audio_file.with_name(
+        f"{audio_file.stem}_transcript_draft.json"
+    )
+
+    with open(draft_file, "w", encoding="utf-8") as f:
+        json.dump(draft, f, indent=2)
+
+    return draft_file
+
+
+def render_markdown_from_draft(
+    source_audio,
+    diarized_segments,
+    output_file,
+    language,
+    speaker_map
+):
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write("---\n")
+        f.write("type: meeting-transcript\n")
+        f.write("source: voicemeeter\n")
+        f.write("---\n\n")
+
+        f.write(f"# {Path(source_audio).stem}\n\n")
+
+        current_speaker = None
+        current_start = None
+        speaker_text = []
+
+        for segment in diarized_segments:
+            speaker_id = segment["speaker_id"]
+            display_name = speaker_map.get(
+                speaker_id,
+                speaker_id
+            )
+
+            if current_speaker is None:
+                current_speaker = display_name
+                current_start = int(segment["start"])
+
+            elif display_name != current_speaker:
+                minutes = current_start // 60
+                seconds = current_start % 60
+
+                f.write(f"## {current_speaker}\n\n")
+                f.write(
+                    f"[{minutes:02}:{seconds:02}] "
+                    + " ".join(speaker_text)
+                    + "\n\n"
+                )
+
+                current_speaker = display_name
+                current_start = int(segment["start"])
+                speaker_text = []
+
+            speaker_text.append(segment["text"].strip())
+
+        if speaker_text:
+            minutes = current_start // 60
+            seconds = current_start % 60
+
+            f.write(f"## {current_speaker}\n\n")
+            f.write(
+                f"[{minutes:02}:{seconds:02}] "
+                + " ".join(speaker_text)
+                + "\n\n"
+            )
+
+        speaker_ids = sorted(
+            set(seg["speaker_id"] for seg in diarized_segments)
+        )
+
+        duration_seconds = 0
+        if diarized_segments:
+            duration_seconds = int(diarized_segments[-1]["end"])
+
+        f.write("---\n\n")
+        f.write("## Transcript Statistics\n\n")
+
+        f.write(
+            f"- Duration: {duration_seconds // 60}m "
+            f"{duration_seconds % 60}s\n"
+        )
+        f.write(f"- Language: {language}\n")
+        f.write(f"- Speakers: {len(speaker_ids)}\n\n")
+
+        f.write("## Speakers\n\n")
+        for speaker_id in speaker_ids:
+            display_name = speaker_map.get(speaker_id, speaker_id)
+            if display_name == speaker_id:
+                f.write(f"- {speaker_id}\n")
+            else:
+                f.write(f"- {display_name} ({speaker_id})\n")
+
+
+def refresh_speaker_history(
+    speaker_history,
+    speaker_map,
+    stable_speaker_ids
+):
+    for speaker_id in stable_speaker_ids:
+        if speaker_id in speaker_map:
+            speaker_history[speaker_id] = {
+                "canonical_name": speaker_map[speaker_id],
+                "confidence": 1.0
+            }
+
+    save_json_file(SPEAKER_HISTORY_FILE, speaker_history)
+
+
+def re_render_from_draft_file(draft_path):
+    draft_path = Path(draft_path)
+    if not draft_path.exists():
+        raise FileNotFoundError(f"Draft file not found: {draft_path}")
+
+    draft = load_json_file(draft_path, None)
+    if not isinstance(draft, dict):
+        raise RuntimeError(f"Invalid draft JSON: {draft_path}")
+
+    source_audio = draft.get("source_audio")
+    diarized_segments = draft.get("segments", [])
+
+    if not source_audio or not isinstance(diarized_segments, list):
+        raise RuntimeError("Draft missing source_audio or segments")
+
+    speaker_map = load_speaker_map()
+
+    output_file = Path(source_audio).with_name(
+        f"{Path(source_audio).stem}_transcript.md"
+    )
+
+    render_markdown_from_draft(
+        source_audio,
+        diarized_segments,
+        output_file,
+        language="en",
+        speaker_map=speaker_map
+    )
+
+    stable_speaker_ids = sorted(
+        set(seg.get("speaker_id", "UNKNOWN") for seg in diarized_segments)
+    )
+
+    speaker_history = load_speaker_history()
+    refresh_speaker_history(
+        speaker_history,
+        speaker_map,
+        stable_speaker_ids
+    )
+
+    print(f"Re-rendered transcript: {output_file}")
 
 # --------------------------------------------------
 # LOAD MODELS
@@ -436,9 +764,43 @@ def transcribe_file(audio_file):
                 audio_file
             )
 
-        # ------------------------------------------
-        # OUTPUT
-        # ------------------------------------------
+        diarized_segments = []
+        for segment in segments:
+            speaker_id = find_speaker(
+                segment.start,
+                segment.end
+            )
+
+            diarized_segments.append(
+                {
+                    "speaker_id": speaker_id,
+                    "start": float(segment.start),
+                    "end": float(segment.end),
+                    "text": segment.text.strip()
+                }
+            )
+
+        stable_speaker_ids = sorted(
+            set(seg["speaker_id"] for seg in diarized_segments)
+        )
+
+        speaker_map = load_speaker_map()
+        speaker_history = load_speaker_history()
+        attendees = load_attendees()
+
+        suggestions = suggest_speaker_names(
+            stable_speaker_ids,
+            speaker_map,
+            speaker_history,
+            attendees
+        )
+
+        draft_file = save_draft_speaker_artifacts(
+            audio_file,
+            diarized_segments,
+            speaker_map,
+            suggestions
+        )
 
         output_file = audio_file.with_name(
             f"{audio_file.stem}_transcript.md"
@@ -448,136 +810,23 @@ def transcribe_file(audio_file):
             f"Saving: {output_file.name}"
         )
 
-        with open(
+        render_markdown_from_draft(
+            str(audio_file),
+            diarized_segments,
             output_file,
-            "w",
-            encoding="utf-8"
-        ) as f:
+            info.language,
+            speaker_map
+        )
 
-            f.write("---\n")
-            f.write(
-                "type: meeting-transcript\n"
-            )
-            f.write(
-                "source: voicemeeter\n"
-            )
-            f.write("---\n\n")
+        refresh_speaker_history(
+            speaker_history,
+            speaker_map,
+            stable_speaker_ids
+        )
 
-            f.write(
-                f"# {audio_file.stem}\n\n"
-            )
-
-            current_speaker = None
-            current_start = None
-            speaker_text = []
-
-            for segment in segments:
-                speaker = find_speaker(
-                    segment.start,
-                    segment.end
-                )
-
-                if current_speaker is None:
-                    current_speaker = speaker
-                    current_start = int(
-                        segment.start
-                    )
-
-                elif speaker != current_speaker:
-                    minutes = (
-                        current_start // 60
-                    )
-                    seconds = (
-                        current_start % 60
-                    )
-
-                    f.write(
-                        f"## {current_speaker}\n\n"
-                    )
-
-                    f.write(
-                        f"[{minutes:02}:{seconds:02}] "
-                        + " ".join(
-                            speaker_text
-                        )
-                        + "\n\n"
-                    )
-
-                    current_speaker = speaker
-                    current_start = int(
-                        segment.start
-                    )
-
-                    speaker_text = []
-
-                speaker_text.append(
-                    segment.text.strip()
-                )
-
-            if speaker_text:
-                minutes = (
-                    current_start // 60
-                )
-                seconds = (
-                    current_start % 60
-                )
-
-                f.write(
-                    f"## {current_speaker}\n\n"
-                )
-
-                f.write(
-                    f"[{minutes:02}:{seconds:02}] "
-                    + " ".join(
-                        speaker_text
-                    )
-                    + "\n\n"
-                )
-
-            speakers = sorted(
-                set(
-                    region["speaker"]
-                    for region
-                    in speaker_regions
-                )
-            )
-
-            duration_seconds = 0
-
-            if segments:
-                duration_seconds = int(
-                    segments[-1].end
-                )
-
-            f.write("---\n\n")
-            f.write(
-                "## Transcript Statistics\n\n"
-            )
-
-            f.write(
-                f"- Duration: "
-                f"{duration_seconds // 60}m "
-                f"{duration_seconds % 60}s\n"
-            )
-
-            f.write(
-                f"- Language: "
-                f"{info.language}\n"
-            )
-
-            f.write(
-                f"- Speakers: "
-                f"{len(speakers)}\n\n"
-            )
-
-            f.write(
-                "## Speakers\n\n"
-            )
-
-            for speaker in speakers:
-                f.write(
-                    f"- {speaker}\n"
-                )
+        print(
+            f"Draft speaker file: {draft_file.name}"
+        )
 
         update_status(
             audio_file,
@@ -619,7 +868,7 @@ def transcription_worker():
                 audio_file,
                 "processing"
             )
-            
+
             success = False
 
             for attempt in range(
@@ -711,6 +960,16 @@ class VoiceMeeterHandler(
 # --------------------------------------------------
 # START WORKER
 # --------------------------------------------------
+
+if os.getenv("RE_RENDER_ONLY", "0").strip() == "1":
+    draft_source = os.getenv("RE_RENDER_SOURCE", "").strip()
+    if not draft_source:
+        raise RuntimeError(
+            "RE_RENDER_ONLY=1 requires RE_RENDER_SOURCE=<path to *_transcript_draft.json>"
+        )
+
+    re_render_from_draft_file(draft_source)
+    raise SystemExit(0)
 
 worker = Thread(
     target=transcription_worker,
