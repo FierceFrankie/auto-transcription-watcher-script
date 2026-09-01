@@ -14,6 +14,7 @@ from watchdog.observers import Observer
 from faster_whisper import WhisperModel
 import nemo.collections.asr as nemo_asr
 from pyannote.audio import Pipeline
+import whisperx
 
 # --------------------------------------------------
 # CONFIG
@@ -53,11 +54,11 @@ RECORDING_IDLE_SECONDS = 30
 MAX_RETRIES = 3
 RETRY_DELAY = 30
 
-# ASR backend: "whisper" or "parakeet"
+# ASR backend: "whisper", "parakeet", or "whisperx"
 ASR_BACKEND = os.getenv("ASR_BACKEND", "whisper").strip().lower()
-if ASR_BACKEND not in {"whisper", "parakeet"}:
+if ASR_BACKEND not in {"whisper", "parakeet", "whisperx"}:
     raise RuntimeError(
-        "ASR_BACKEND must be 'whisper' or 'parakeet'"
+        "ASR_BACKEND must be 'whisper', 'parakeet', or 'whisperx'"
     )
 
 # --------------------------------------------------
@@ -403,6 +404,8 @@ def re_render_from_draft_file(draft_path):
 
 whisper = None
 parakeet = None
+whisperx_model = None
+whisperx_diarize = None
 
 if ASR_BACKEND == "whisper":
     print("Loading Whisper Large-v3-Turbo...")
@@ -417,15 +420,28 @@ elif ASR_BACKEND == "parakeet":
         model_name="nvidia/parakeet-tdt-0.6b-v2"
     )
     parakeet = parakeet.to("cuda")
+elif ASR_BACKEND == "whisperx":
+    print("Loading WhisperX Large-v3...")
+    whisperx_model = whisperx.load_model(
+        "large-v3",
+        "cuda",
+        compute_type="float16",
+        language="en"
+    )
+    print("Loading WhisperX diarization...")
+    whisperx_diarize = whisperx.DiarizationPipeline(
+        use_auth_token=HF_TOKEN,
+        device="cuda"
+    )
 
-print("Loading PyAnnote...")
-
-pipeline = Pipeline.from_pretrained(
-    "pyannote/speaker-diarization-3.1",
-    token=HF_TOKEN
-)
-
-pipeline.to(torch.device("cuda"))
+pipeline = None
+if ASR_BACKEND != "whisperx":
+    print("Loading PyAnnote...")
+    pipeline = Pipeline.from_pretrained(
+        "pyannote/speaker-diarization-3.1",
+        token=HF_TOKEN
+    )
+    pipeline.to(torch.device("cuda"))
 
 print("Models loaded.")
 
@@ -522,6 +538,40 @@ def transcribe_with_parakeet(audio_file):
 
     info = TranscriptionInfo(language="en")
     return segments, info
+
+
+def transcribe_with_whisperx(audio_file):
+    audio = whisperx.load_audio(str(audio_file))
+    result = whisperx_model.transcribe(audio, batch_size=16)
+
+    diarization = whisperx_diarize(audio)
+    result = whisperx.assign_word_speakers(
+        diarization,
+        result
+    )
+
+    diarized_segments = []
+    for segment in result.get("segments", []):
+        text = (segment.get("text", "") or "").strip()
+        if not text:
+            continue
+
+        start = float(segment.get("start", 0.0) or 0.0)
+        end = float(segment.get("end", start) or start)
+
+        diarized_segments.append(
+            {
+                "speaker_id": segment.get("speaker", "UNKNOWN"),
+                "start": start,
+                "end": end,
+                "text": text
+            }
+        )
+
+    info = TranscriptionInfo(
+        language=result.get("language", "en")
+    )
+    return diarized_segments, info
 
 # --------------------------------------------------
 # DATABASE FUNCTIONS
@@ -681,104 +731,112 @@ def transcribe_file(audio_file):
         elif waveform.ndim == 2:
             waveform = waveform.T
 
-        # ------------------------------------------
-        # DIARIZATION
-        # ------------------------------------------
-
-        print(
-            "Running speaker diarization..."
-        )
-
-        diarization = pipeline(
-            {
-                "waveform": waveform,
-                "sample_rate": sample_rate
-            }
-        )
-
-        speaker_regions = []
-
-        annotation = diarization.speaker_diarization
-
-        for turn, _, speaker in annotation.itertracks(
-            yield_label=True
-        ):
-            speaker_regions.append(
-                {
-                    "start": float(turn.start),
-                    "end": float(turn.end),
-                    "speaker": speaker
-                }
+        if ASR_BACKEND == "whisperx":
+            print(
+                "Running WhisperX transcription + diarization..."
             )
-
-        print(
-            f"Found "
-            f"{len(speaker_regions)} "
-            f"speaker segments"
-        )
-
-        # ------------------------------------------
-        # SPEAKER LOOKUP
-        # ------------------------------------------
-
-        def find_speaker(
-            start_time,
-            end_time
-        ):
-            best_speaker = "UNKNOWN"
-            best_overlap = 0
-
-            for region in speaker_regions:
-                overlap = max(
-                    0,
-                    min(
-                        end_time,
-                        region["end"]
-                    )
-                    - max(
-                        start_time,
-                        region["start"]
-                    )
-                )
-
-                if overlap > best_overlap:
-                    best_overlap = overlap
-                    best_speaker = region["speaker"]
-
-            return best_speaker
-
-        # ------------------------------------------
-        # ASR
-        # ------------------------------------------
-
-        print(
-            "Running transcription..."
-        )
-
-        if ASR_BACKEND == "whisper":
-            segments, info = transcribe_with_whisper(
+            diarized_segments, info = transcribe_with_whisperx(
                 audio_file
             )
         else:
-            segments, info = transcribe_with_parakeet(
-                audio_file
+            # ------------------------------------------
+            # DIARIZATION
+            # ------------------------------------------
+
+            print(
+                "Running speaker diarization..."
             )
 
-        diarized_segments = []
-        for segment in segments:
-            speaker_id = find_speaker(
-                segment.start,
-                segment.end
-            )
-
-            diarized_segments.append(
+            diarization = pipeline(
                 {
-                    "speaker_id": speaker_id,
-                    "start": float(segment.start),
-                    "end": float(segment.end),
-                    "text": segment.text.strip()
+                    "waveform": waveform,
+                    "sample_rate": sample_rate
                 }
             )
+
+            speaker_regions = []
+
+            annotation = diarization.speaker_diarization
+
+            for turn, _, speaker in annotation.itertracks(
+                yield_label=True
+            ):
+                speaker_regions.append(
+                    {
+                        "start": float(turn.start),
+                        "end": float(turn.end),
+                        "speaker": speaker
+                    }
+                )
+
+            print(
+                f"Found "
+                f"{len(speaker_regions)} "
+                f"speaker segments"
+            )
+
+            # ------------------------------------------
+            # SPEAKER LOOKUP
+            # ------------------------------------------
+
+            def find_speaker(
+                start_time,
+                end_time
+            ):
+                best_speaker = "UNKNOWN"
+                best_overlap = 0
+
+                for region in speaker_regions:
+                    overlap = max(
+                        0,
+                        min(
+                            end_time,
+                            region["end"]
+                        )
+                        - max(
+                            start_time,
+                            region["start"]
+                        )
+                    )
+
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_speaker = region["speaker"]
+
+                return best_speaker
+
+            # ------------------------------------------
+            # ASR
+            # ------------------------------------------
+
+            print(
+                "Running transcription..."
+            )
+
+            if ASR_BACKEND == "whisper":
+                segments, info = transcribe_with_whisper(
+                    audio_file
+                )
+            else:
+                segments, info = transcribe_with_parakeet(
+                    audio_file
+                )
+
+            diarized_segments = []
+            for segment in segments:
+                speaker_id = find_speaker(
+                    segment.start,
+                    segment.end
+                )
+
+                diarized_segments.append(
+                    {
+                        "speaker_id": speaker_id,
+                        "start": float(segment.start),
+                        "end": float(segment.end),
+                        "text": segment.text.strip()
+                    }
+                )
 
         stable_speaker_ids = sorted(
             set(seg["speaker_id"] for seg in diarized_segments)

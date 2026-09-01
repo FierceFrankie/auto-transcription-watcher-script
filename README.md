@@ -1,14 +1,15 @@
 # Voicemeeter Auto Transcriber with Speaker Diarization
 
-Automatically monitor Voicemeeter recordings, transcribe audio using Faster-Whisper (or Parakeet), identify speakers using PyAnnote, and generate clean Markdown transcripts for Obsidian.
+Automatically monitor Voicemeeter recordings, transcribe audio using Faster-Whisper, WhisperX, or Parakeet, identify speakers, and generate clean Markdown transcripts for Obsidian.
 
 ## Features
 
 - Folder watcher for new Voicemeeter recordings
 - Automatically waits for recording completion
 - GPU-accelerated transcription using Faster-Whisper
+- Optional WhisperX ASR backend (with built-in diarization)
 - Optional NVIDIA Parakeet ASR backend
-- Speaker diarization with PyAnnote
+- Speaker diarization with PyAnnote (WhisperX uses its own diarization pipeline)
 - Consecutive speaker segments grouped together
 - **Stable speaker IDs preserved** (`speaker_id`)
 - **Custom speaker name mapping** from `config/speakers.json`
@@ -97,7 +98,7 @@ Charlie Kim
 ## Environment Variables
 
 - `HF_TOKEN` (required)
-- `ASR_BACKEND` (`whisper` or `parakeet`, default `whisper`)
+- `ASR_BACKEND` (`whisper`, `whisperx`, or `parakeet`, default `whisper`)
 - `SPEAKER_MAP_FILE` (optional, default `config/speakers.json`)
 - `SPEAKER_HISTORY_FILE` (optional, default `config/speaker_history.json`)
 - `ATTENDEE_LIST_FILE` (optional, default `config/attendees.txt`)
